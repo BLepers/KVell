@@ -1,0 +1,5 @@
+These are results from an i3.metal instance.
+To reproduce:
+
+./scripts/config-aws.sh
+./scripts/run-aws.sh
