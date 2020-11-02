@@ -7,7 +7,7 @@ char *create_unique_item(size_t item_size, uint64_t uid) {
    char *item = malloc(item_size);
    struct item_metadata *meta = (struct item_metadata *)item;
    meta->key_size = 8;
-   meta->value_size = item_size - 64 - sizeof(*meta);
+   meta->value_size = item_size - 8 - sizeof(*meta);
 
    char *item_key = &item[sizeof(*meta)];
    char *item_value = &item[sizeof(*meta) + meta->key_size];

@@ -1,5 +1,9 @@
 # KVell: the Design and Implementation of a Fast Persistent Key-Value Store
 
+---
+> **_NOTE:_**
+> Switch to the "osdi" branch for the code and README related to "KVell+: Snapshot Isolation Without Snapshots".
+---
 
 ## Compiling and reproducing results
 
@@ -36,6 +40,8 @@ See [OVERVIEW.md](OVERVIEW.md) to understand the logic of the code.
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details
 
-## Paper
+## Papers
 
 Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel. 2019. KVell: the Design and Implementation of a Fast Persistent Key-Value Store. In Proceedings of SOSP’19: ACM Symposium on Operating Systems Principles (SOSP’19) [[pdf](sosp19-final40.pdf)].
+
+Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy Zwaenepoel. 2021. KVell+: Snapshot Isolation Without Snapshots. In Proceedings of OSDI’20: USENIX Symposium on Operating Systems Design and Implementation (OSDI’20) [[pdf](osdi20-final180.pdf)].
