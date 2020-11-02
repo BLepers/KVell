@@ -27,7 +27,6 @@ struct pdata {
 };
 
 static char *path = NULL;
-static int nb_threads = 0;
 
 static int io_setup(unsigned nr, aio_context_t *ctxp) {
 	return syscall(__NR_io_setup, nr, ctxp);
@@ -46,9 +45,11 @@ static int io_getevents(aio_context_t ctx, long min_nr, long max_nr,
 	return syscall(__NR_io_getevents, ctx, min_nr, max_nr, events, timeout);
 }
 
-void *do_libaio(void *data) {
-   int tid = __sync_fetch_and_add(&nb_threads, 1);
+int get_worker_id() {
+   return 0;
+}
 
+void *do_libaio(void *data) {
    struct pdata *pdata = data;
    int fd = pdata->fd;
    int queue_size = pdata->queue_size;
@@ -71,7 +72,6 @@ void *do_libaio(void *data) {
       exit(-1);
    }
 
-   declare_periodic_count;
    declare_breakdown;
 
    for(size_t i = 0; i < nb_accesses; ) {
@@ -97,20 +97,20 @@ void *do_libaio(void *data) {
 
          cbs[j] = &cb[j];
 
-         periodic_count(1000, "[TID %d] LibAIO", tid);
          i++;
       }
 
       ret = io_submit(ctx, queue_size, cbs);
+
       if (ret != queue_size) {
          if (ret < 0) perror("io_submit");
          else fprintf(stderr, "io_submit only submitted %d\n", ret);
       } __1
       ret = io_getevents(ctx, ret, ret, events, NULL); __2
 
-      wait_for(450000); __3
+      //wait_for(450000); __3
 
-      show_breakdown_periodic(1000, i, "io_submit", "io_getevents", "waiting", "unused", "unused");
+      show_breakdown_periodic(1000, i, "io_submit", "io_getevents", "waiting", "unused", "unused", "unused", "");
    }
 
    ret = io_destroy(ctx);
@@ -167,8 +167,8 @@ int bench_io(void) {
    fd = open(path,  O_RDWR | O_CREAT | O_NONBLOCK | O_DIRECT, 0777);
 
    /* libaio perf - various queue size */
-   size_t queue_sizes[] = { 56 };
-   for(size_t rw = RO; rw <= RO; rw++) {
+   size_t queue_sizes[] = { 64 };
+   for(size_t rw = WO; rw <= WO; rw++) {
       for(size_t q = 0; q < sizeof(queue_sizes)/sizeof(*queue_sizes); q++) {
          size_t queue_size = queue_sizes[q];
 
@@ -206,83 +206,12 @@ int bench_io(void) {
 /*
  * Data structures tests
  */
-#define NB_INSERTS 10000000LU
+#define NB_INSERTS 100000000LU
 
 int bench_data_structures(void) {
    declare_timer;
    declare_memory_counter;
 
-
-   /*
-    * RBTREE
-    */
-   rbtree r = rbtree_create();
-
-   start_timer {
-      struct index_entry e;
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         rbtree_insert(r, (void*)hash, &e, pointer_cmp);
-      }
-   } stop_timer("RBTREE - Time for %lu inserts/replace (%lu inserts/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   start_timer {
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         rbtree_lookup(r, (void*)hash, pointer_cmp);
-      }
-   } stop_timer("RBTREE - Time for %lu finds (%lu finds/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   get_memory_usage("RBTREE");
-
-
-   /*
-    * RAX - https://github.com/antirez/rax
-    */
-   rax *rt = raxNew();
-
-   start_timer {
-      struct index_entry *e;
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         e = malloc(sizeof(*e));
-         raxInsert(rt,(unsigned char*)&hash, sizeof(hash), e,NULL);
-      }
-   } stop_timer("RAX - Time for %lu inserts/replace (%lu inserts/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   start_timer {
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         raxFind(rt,(unsigned char*)&hash, sizeof(hash));
-      }
-   } stop_timer("RAX - Time for %lu finds (%lu finds/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   get_memory_usage("RAX");
-
-
-   /*
-    * ART - https://github.com/armon/libart
-    */
-   art_tree t;
-   art_tree_init(&t);
-
-   start_timer {
-      struct index_entry *e;
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         e = malloc(sizeof(*e));
-         art_insert(&t, (unsigned char*)&hash, sizeof(hash), e);
-      }
-   } stop_timer("ART - Time for %lu inserts/replace (%lu inserts/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   start_timer {
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         art_search(&t, (unsigned char*)&hash, sizeof(hash));
-      }
-   } stop_timer("ART - Time for %lu finds (%lu finds/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   get_memory_usage("ART");
 
    /*
     * BTREE
@@ -298,7 +227,7 @@ int bench_data_structures(void) {
    } stop_timer("BTREE - Time for %lu inserts/replace (%lu inserts/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
 
    start_timer {
-      struct index_entry e;
+      struct index_entry *e;
       for(size_t i = 0; i < NB_INSERTS; i++) {
          uint64_t hash = xorshf96()%NB_INSERTS;
          btree_find(b, (unsigned char*)&hash, sizeof(hash), &e);
@@ -361,7 +290,8 @@ void bench_zipf(void) {
 }
 
 int main(int argc, char **argv) {
-   path = "/scratch0/blepers/rand";
+   path = "/scratch0/blepers/slab-0-0-0-1024";
+   srand(time(NULL));
    bench_io();
    //bench_data_structures();
    //bench_zipf();

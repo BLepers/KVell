@@ -7,7 +7,6 @@
 
 static char *_create_unique_item_ycsb(uint64_t uid) {
    size_t item_size = 1024;
-   //size_t item_size = sizeof(struct item_metadata) + 2*sizeof(size_t);
    return create_unique_item(item_size, uid);
 }
 
@@ -59,16 +58,7 @@ static void _launch_ycsb_e(int test, int nb_requests, int zipfian) {
          cb->item = _create_unique_item_ycsb(rand_next());
          kv_update_async(cb);
       } else {  // or we scan
-         char *item = _create_unique_item_ycsb(rand_next());
-         tree_scan_res_t scan_res = kv_init_scan(item, uniform_next()%99+1);
-         free(item);
-         for(size_t j = 0; j < scan_res.nb_entries; j++) {
-            struct slab_callback *cb = bench_cb();
-            cb->item = _create_unique_item_ycsb(scan_res.hashes[j]);
-            kv_read_async_no_lookup(cb, scan_res.entries[j].slab, scan_res.entries[j].slab_idx);
-         }
-         free(scan_res.hashes);
-         free(scan_res.entries);
+         die("Old scan interface no longer works in transactional KVell");
       }
       periodic_count(1000, "YCSB Load Injector (scans) (%lu%%)", i*100LU/nb_requests);
    }

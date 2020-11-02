@@ -27,13 +27,17 @@
 #include "items.h"
 
 #include "pagecache.h"
-#include "in-memory-index-generic.h"
+#include "in-memory-index.h"
 #include "ioengine.h"
 #include "slab.h"
 #include "slabworker.h"
+#include "transaction.h"
+#include "transaction-helpers.h"
+#include "injectorqueue.h"
 
 #include "stats.h"
 #include "freelist.h"
+#include "gc.h"
 
 #include "workload-common.h"
 

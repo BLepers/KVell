@@ -23,7 +23,8 @@ used=`df -h | grep nvme | perl -pe 's/.*?([0-9]).*/\1/'` # For some reason / is 
 j=0
 for i in 0 1 2 3 4 5 6 7 8; do
    [ "$i" = "$used" ] && continue
-   mkfs -t ext4 /dev/nvme${i}n1
+   #mkfs -t ext4 /dev/nvme${i}n1
+   mkfs -t ext4 -E lazy_itable_init=0,lazy_journal_init=0 /dev/nvme${i}n1
    mkdir /scratch${j}
    mount -o rw,noatime,nodiratime,block_validity,delalloc,nojournal_checksum,barrier,user_xattr,acl /dev/nvme${i}n1 /scratch${j}/
    mkdir /scratch${j}/kvell

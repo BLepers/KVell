@@ -9,6 +9,7 @@
 #define die(msg, args...) \
    do {                         \
       fprintf(stderr,"(%s,%d) " msg "\n", __FUNCTION__ , __LINE__, ##args); \
+      fflush(stdout); \
       exit(-1); \
    } while(0)
 
@@ -56,6 +57,19 @@
    printf("(%s,%d) [%6lums] " msg "\n", __FUNCTION__ , __LINE__, elapsed/1000, ##args); \
 } while(0)
 
+/*
+ * Cute timer macros
+ */
+#define struct_declare_timer uint64_t elapsed; \
+   struct timeval st, et;
+
+#define struct_start_timer(s) gettimeofday(&(s)->st,NULL);
+
+#define struct_stop_timer(s, msg, args...) ;do { \
+   gettimeofday(&(s)->et,NULL); \
+   (s)->elapsed = (((s)->et.tv_sec - (s)->st.tv_sec) * 1000000) + ((s)->et.tv_usec - (s)->st.tv_usec) + 1; \
+   printf("(%s,%d) [%6lums] " msg "\n", __FUNCTION__ , __LINE__, (s)->elapsed/1000, ##args); \
+} while(0)
 
 /*
  * Cute debug timer.
@@ -142,11 +156,16 @@
       uint64_t evt3; \
       uint64_t evt4; \
       uint64_t evt5; \
+      uint64_t evt6; \
       uint64_t loops; \
       uint64_t count; \
    } __breakdown = {}; \
-   rdtscll(__breakdown.real_start); \
-   __breakdown.start = __breakdown.real_start;
+   if(!__breakdown.real_start) { \
+      rdtscll(__breakdown.real_start); \
+      __breakdown.start = __breakdown.real_start; \
+   } else { \
+      rdtscll(__breakdown.start); \
+   }
 
 #define __1 \
    do { \
@@ -183,7 +202,14 @@
       __breakdown.start = __breakdown.now; \
    } while(0);
 
-#define show_breakdown_periodic(period, _count, _evt1, _evt2, _evt3, _evt4, _evt5) \
+#define __6 \
+   do { \
+      rdtscll(__breakdown.now); \
+      __breakdown.evt6 += __breakdown.now - __breakdown.start; \
+      __breakdown.start = __breakdown.now; \
+   } while(0);
+
+#define show_breakdown_periodic(period, _count, _evt1, _evt2, _evt3, _evt4, _evt5, _evt6, msg, args...) \
    do { \
       __breakdown.loops++; \
       rdtscll(__breakdown.now); \
@@ -191,23 +217,26 @@
       if(cycles_to_us(elapsed) > ((period)*1000LU)) { \
          uint64_t count_diff = _count - __breakdown.count; \
          __breakdown.count = _count; \
-         printf("[WORKER BREAKDOWN] " _evt1 "%3lu%% - " _evt2 " %3lu%% - " _evt3 " %3lu%% - " _evt4 " %3lu%% - " _evt5 " %3lu%% - %7lu ops - %7lu ops/s - %3lu ops / loop - %lu cycles/op\n", \
+         printf("[WORKER %02d BREAKDOWN] " _evt1 "%3lu%% - " _evt2 " %3lu%% - " _evt3 " %3lu%% - " _evt4 " %3lu%% - " _evt5 " %3lu%% - " _evt6 " %3lu%% - %7lu ops - %7lu ops/s - %3lu ops / loop - %lu cycles/op" msg "\n", \
+               get_worker_id(), \
                __breakdown.evt1*100LU/elapsed, \
                __breakdown.evt2*100LU/elapsed, \
                __breakdown.evt3*100LU/elapsed, \
                __breakdown.evt4*100LU/elapsed, \
                __breakdown.evt5*100LU/elapsed, \
+               __breakdown.evt6*100LU/elapsed, \
                count_diff, \
                count_diff * period * 1000 / cycles_to_us(elapsed), \
                count_diff/__breakdown.loops, \
-               elapsed / count_diff \
-               ); \
+               count_diff?(elapsed / count_diff):0, \
+               ##args); \
          __breakdown.real_start = __breakdown.now; \
          __breakdown.evt1 = 0; \
          __breakdown.evt2 = 0; \
          __breakdown.evt3 = 0; \
          __breakdown.evt4 = 0; \
          __breakdown.evt5 = 0; \
+         __breakdown.evt6 = 0; \
          __breakdown.loops = 0; \
       } \
    } while(0);
@@ -228,6 +257,46 @@
    __used_mem = __memory.ru_maxrss - __previous_mem; \
    __previous_mem = __memory.ru_maxrss; \
    printf("(%s,%d) [%lu MB total - %lu MB since last measure] " msg "\n", __FUNCTION__ , __LINE__, __previous_mem/1024, __used_mem/1024, ##args);
+
+/*
+ * Per thread timing statistics macro
+ */
+#define declare_periodic_overhead \
+      uint64_t __real_start = 0, __last_dump, __start, __last, __nb_count = 0, __total = 0, maybe_unused __last_count = 0; \
+      if(!__real_start) { \
+         rdtscll(__real_start); \
+         __last_dump = __real_start; \
+         __nb_count = 0; \
+      } \
+
+#define start_periodic_overhead rdtscll(__start);
+
+#define stop_periodic_overhead(period, name, msg, args...) \
+   do { \
+      rdtscll(__last); \
+      __total += __last - __start; \
+      __nb_count ++; \
+      if(cycles_to_us(__last - __last_dump) > ((period)*1000LU)) { \
+         printf("[" name "] " msg " %lu%% - %7lu ops/s\n", ##args, __total*100LU/(__last - __last_dump), __nb_count*1000000LU/cycles_to_us(__last - __last_dump)); \
+         __nb_count = 0; \
+         __last_dump = __last; \
+         __total = 0; \
+      } \
+   } while(0);
+
+#define stop_periodic_overhead2(period, count, name, msg, args...) \
+   do { \
+      rdtscll(__last); \
+      __total += __last - __start; \
+      __nb_count += (count) - __last_count; \
+      __last_count = (count); \
+      if(cycles_to_us(__last - __last_dump) > ((period)*1000LU)) { \
+         printf("[" name "] " msg " %lu%% - %7lu ops/s\n", ##args, __total*100LU/(__last - __last_dump), __nb_count*1000000LU/cycles_to_us(__last - __last_dump)); \
+         __nb_count = 0; \
+         __last_dump = __last; \
+         __total = 0; \
+      } \
+   } while(0);
 
 /*
  * Busy waiting

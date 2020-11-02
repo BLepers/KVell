@@ -36,22 +36,13 @@ void *safe_pread(int fd, off_t offset) {
    return disk_data;
 }
 
-/*
- * Async API definition
- */
-static int io_setup(unsigned nr, aio_context_t *ctxp) {
-	return syscall(__NR_io_setup, nr, ctxp);
+void safe_pwrite(int fd, off_t offset, off_t offset_in_page, size_t size, void *data) {
+   char *disk_data = safe_pread(fd, offset);
+   memcpy(&disk_data[offset_in_page], data, size);
+   int r = pwrite(fd, disk_data, PAGE_SIZE, offset);
+   if(r != PAGE_SIZE)
+      perr("pwrite failed! Wrote %d instead of %lu (offset %lu)\n", r, PAGE_SIZE, offset);
 }
-
-static int io_submit(aio_context_t ctx, long nr, struct iocb **iocbpp) {
-	return syscall(__NR_io_submit, ctx, nr, iocbpp);
-}
-
-static int io_getevents(aio_context_t ctx, long min_nr, long max_nr,
-		struct io_event *events, struct timespec *timeout) {
-	return syscall(__NR_io_getevents, ctx, min_nr, max_nr, events, timeout);
-}
-
 
 /*
  * Definition of the context of an IO worker thread
@@ -61,6 +52,7 @@ struct linked_callbacks {
    struct linked_callbacks *next;
 };
 struct io_context {
+   int worker_id;
    aio_context_t ctx __attribute__((aligned(64)));
    volatile size_t sent_io;
    volatile size_t processed_io;
@@ -71,6 +63,59 @@ struct io_context {
    struct io_event *events;
    struct linked_callbacks *linked_callbacks;
 };
+
+/*
+ * Async API definition
+ */
+static int io_setup(unsigned nr, aio_context_t *ctxp) {
+	return syscall(__NR_io_setup, nr, ctxp);
+}
+
+#define MAX_STAT 300000
+static __thread size_t queue_length[MAX_STAT];
+static __thread size_t queue_time[MAX_STAT];
+static __thread size_t queue_idx, dumped;
+size_t collect_stats = 0, _print_stats = 0;
+static int io_submit(struct io_context *ctx, long nr, struct iocb **iocbpp) {
+   if(collect_stats) {
+      uint64_t s;
+      rdtscll(s);
+      queue_time[queue_idx] = s;
+      queue_length[queue_idx] = nr;
+      queue_idx++;
+   }
+   if(_print_stats && !dumped) {
+      for(size_t i = 0; i < queue_idx; i++) {
+         printf("%d %lu %lu\n", ctx->worker_id, queue_time[i], queue_length[i]);
+      }
+      dumped = 1;
+   }
+
+   static __thread declare_periodic_overhead;
+   start_periodic_overhead;
+   stop_periodic_overhead2(1000, ctx->sent_io, "IO PER SEC", "io_submit");
+	return syscall(__NR_io_submit, ctx->ctx, nr, iocbpp);
+}
+
+static int io_getevents(struct io_context *ctx, long min_nr, long max_nr,
+		struct io_event *events, struct timespec *timeout) {
+	int nr = syscall(__NR_io_getevents, ctx->ctx, min_nr, max_nr, events, timeout);
+   if(collect_stats) {
+      uint64_t s;
+      rdtscll(s);
+      queue_time[queue_idx] = s;
+      queue_length[queue_idx] = 0;
+      queue_idx++;
+   }
+   if(_print_stats && !dumped) {
+      for(size_t i = 0; i < queue_idx; i++) {
+         printf("%d %lu %lu\n", ctx->worker_id, queue_time[i], queue_length[i]);
+      }
+      dumped = 1;
+   }
+   return nr;
+}
+
 
 /*
  * After completing IOs we need to call all the "linked callbacks", i.e., reads done to a page that was already in the process of being fetched.
@@ -128,19 +173,12 @@ static void worker_do_io(struct io_context *ctx) {
    }
 
    // Submit requests to the kernel
-   int ret = io_submit(ctx->ctx, pending, ctx->iocbs);
+   int ret = io_submit(ctx, pending, ctx->iocbs);
    if (ret != pending)
       perr("Couldn't submit all io requests! %d submitted / %lu (%lu sent, %lu processed)\n", ret, pending, ctx->sent_io, ctx->processed_io);
    ctx->ios_sent_to_disk = ret;
 }
 
-
-/*
- * do_io = wait for all requests to be completed
- */
-void do_io(void) {
-   // TODO
-}
 
 /* We need a unique hash for each page for the page cache */
 static uint64_t get_hash_for_page(int fd, uint64_t page_num) {
@@ -150,8 +188,8 @@ static uint64_t get_hash_for_page(int fd, uint64_t page_num) {
 /* Enqueue a request to read a page */
 char *read_page_async(struct slab_callback *callback) {
    int alread_used;
-   struct lru *lru_entry;
    void *disk_page;
+   struct lru *lru_entry = callback->lru_entry;
    uint64_t page_num = item_page_num(callback->slab, callback->slab_idx);
    struct io_context *ctx = get_io_context(callback->slab->ctx);
    uint64_t hash = get_hash_for_page(callback->slab->fd, page_num);
@@ -183,6 +221,7 @@ char *read_page_async(struct slab_callback *callback) {
    if(ctx->sent_io - ctx->processed_io >= ctx->max_pending_io)
       die("Sent %lu ios, processed %lu (> %lu waiting), IO buffer is too full!\n", ctx->sent_io, ctx->processed_io, ctx->max_pending_io);
    ctx->sent_io++;
+   assert(is_worker_context());
 
    return NULL;
 }
@@ -193,9 +232,14 @@ char *write_page_async(struct slab_callback *callback) {
    struct lru *lru_entry = callback->lru_entry;
    void *disk_page = lru_entry->page;
    uint64_t page_num = item_page_num(callback->slab, callback->slab_idx);
+   uint64_t hash = get_hash_for_page(callback->slab->fd, page_num);
+
+   if(lru_entry->hash != hash) { // Oops, the content of our page was removed from the page cache before we had a chance to write it...
+      die("The lru entry of the callback does not contain the data we were supposed to write! Can happen if pagecache size is too small relative to QUEUE_DEPTH or for big transactions?\n");
+   }
 
    if(!lru_entry->contains_data) {  // page is not in RAM! Abort!
-      die("WTF?\n");
+      die("Tried to write a page that has not been brought to memory :/\n");
    }
 
    if(lru_entry->dirty) { // this is the second time we write the page, which means it already has been queued for writting
@@ -221,6 +265,7 @@ char *write_page_async(struct slab_callback *callback) {
    if(ctx->sent_io - ctx->processed_io >= ctx->max_pending_io)
       die("Sent %lu ios, processed %lu (> %lu waiting), IO buffer is too full!\n", ctx->sent_io, ctx->processed_io, ctx->max_pending_io);
    ctx->sent_io++;
+   assert(is_worker_context());
 
    return NULL;
 }
@@ -228,10 +273,15 @@ char *write_page_async(struct slab_callback *callback) {
 /*
  * Init an IO worker
  */
-struct io_context *worker_ioengine_init(size_t nb_callbacks) {
+struct io_context *worker_ioengine_init(int id, size_t nb_callbacks) {
    int ret;
    struct io_context *ctx = calloc(1, sizeof(*ctx));
-   ctx->max_pending_io = nb_callbacks * 2;
+   ctx->worker_id = id;
+   if(NEVER_EXCEED_QUEUE_DEPTH) {
+      ctx->max_pending_io = QUEUE_DEPTH * 2;
+   } else {
+      ctx->max_pending_io = nb_callbacks * 2;
+   }
    ctx->iocb = calloc(ctx->max_pending_io, sizeof(*ctx->iocb));
    ctx->iocbs = calloc(ctx->max_pending_io, sizeof(*ctx->iocbs));
    ctx->events = calloc(ctx->max_pending_io, sizeof(*ctx->events));
@@ -257,7 +307,7 @@ void worker_ioengine_get_completed_ios(struct io_context *ctx) {
       return;
 
    start_debug_timer {
-      ret = io_getevents(ctx->ctx, ctx->ios_sent_to_disk - ret, ctx->ios_sent_to_disk - ret, &ctx->events[ret], NULL);
+      ret = io_getevents(ctx, ctx->ios_sent_to_disk - ret, ctx->ios_sent_to_disk - ret, &ctx->events[ret], NULL);
       if(ret != ctx->ios_sent_to_disk)
          die("Problem: only got %d answers out of %lu enqueued IO requests\n", ret, ctx->ios_sent_to_disk);
    } stop_debug_timer(10000, "io_getevents took more than 10ms!!");

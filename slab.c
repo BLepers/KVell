@@ -17,7 +17,22 @@
  *
  *
  * This whole file assumes that when a file is newly created, then all the data is equal to 0. This should be true on Linux.
+ *
+ *
+ * Explanation of not in place update. Each level means possible asynchrony.
+ *
+ * update_item_async [callback->action == UPDATE, callback->old_slab == old slab, callback->old_slab_idx == old index in the slab]
+ * - generic_add_or_update -- because we need to find a free spot
+ * - get_free_item_idx - in freelist.c [callback->slab_idx = valid index or -1 if no free spot is found]
+ *   - generic_add_or_update_cb -- is then called synchronously if no free spot, or asynchronously if there is a free spot (asynchronously because we might need to get the page containing the free spot from disk)
+ *   - generic_add_or_update_with_location -- is then called to update the new spot. First it reads it from page cache or disk.
+ *     - generic_add_or_update_with_location_cb1 -- write the new value to disk
+ *       - finish_update_cb sees that [callback->old_slab] is set ==> need to delete old value
  */
+
+struct slab_callback *new_slab_callback(void) {
+   return calloc(1, sizeof(struct slab_callback));
+}
 
 /*
  * Where is my item in the slab?
@@ -34,10 +49,10 @@ static off_t item_in_page_offset(struct slab *s, size_t idx) {
 /*
  * When first loading a slab from disk we need to rebuild the in memory tree, these functions do that.
  */
-void add_existing_item(struct slab *s, size_t idx, void *_item, struct slab_callback *callback) {
+static void add_existing_item(struct slab *s, size_t idx, void *_item, struct slab_callback *callback) {
    struct item_metadata *item = _item;
    if(item->key_size == -1) { // Removed item
-      add_item_in_free_list_recovery(s, idx, item);
+      add_item_in_partially_freed_list(s, idx, 0);
       if(idx > s->last_item)
          s->last_item = idx;
    } else if(item->key_size != 0) {
@@ -46,16 +61,17 @@ void add_existing_item(struct slab *s, size_t idx, void *_item, struct slab_call
          s->last_item = idx;
       if(item->rdt > get_rdt(s->ctx)) // Remember the maximum timestamp existing in the DB
          set_rdt(s->ctx, item->rdt);
+      //print_item(item->rdt, item);
       if(callback) { // Call the user callback if it exists
          callback->slab_idx = idx;
-         callback->cb(callback, item);
+         call_callback(callback, item);
       }
    } else {
       //printf("Empty item on page #%lu idx %lu\n", page_num, idx);
    }
 }
 
-void process_existing_chunk(int slab_worker_id, struct slab *s, size_t nb_files, size_t file_idx, char *data, size_t start, size_t length, struct slab_callback *callback) {
+static void process_existing_chunk(int slab_worker_id, struct slab *s, size_t nb_files, size_t file_idx, char *data, size_t start, size_t length, struct slab_callback *callback) {
    static __thread declare_periodic_count;
    size_t nb_items_per_page = PAGE_SIZE / s->item_size;
    size_t nb_pages = length / PAGE_SIZE;
@@ -67,13 +83,13 @@ void process_existing_chunk(int slab_worker_id, struct slab *s, size_t nb_files,
          add_existing_item(s, base_idx, &data[current], callback);
          base_idx++;
          current += s->item_size;
-         periodic_count(1000, "[SLAB WORKER %d] Init - Recovered %lu items, %lu free spots", slab_worker_id, s->nb_items, s->nb_free_items);
+         periodic_count(1000, "[SLAB WORKER %d] Init - Recovered %lu items, %lu free spots", slab_worker_id, s->nb_items, s->nb_partially_freed_items);
       }
    }
 }
 
 #define GRANULARITY_REBUILD (2*1024*1024) // We rebuild 2MB by 2MB
-void rebuild_index(int slab_worker_id, struct slab *s, struct slab_callback *callback) {
+static void rebuild_index(int slab_worker_id, struct slab *s, struct slab_callback *callback) {
    char *cached_data = aligned_alloc(PAGE_SIZE, GRANULARITY_REBUILD);
 
    int fd = s->fd;
@@ -97,7 +113,6 @@ void rebuild_index(int slab_worker_id, struct slab *s, struct slab_callback *cal
    }
    free(cached_data);
    s->last_item++;
-   rebuild_free_list(s);
 }
 
 
@@ -107,13 +122,16 @@ void rebuild_index(int slab_worker_id, struct slab *s, struct slab_callback *cal
  * Create a slab: a file that only contains items of a given size.
  * @callback is a callback that will be called on all previously existing items of the slab if it is restored from disk.
  */
-struct slab* create_slab(struct slab_context *ctx, int slab_worker_id, size_t item_size, struct slab_callback *callback) {
+static struct slab* _create_slab(struct slab_context *ctx, int slab_worker_id, size_t item_size, struct slab_callback *callback, int is_transaction) {
    struct stat sb;
    char path[512];
    struct slab *s = calloc(1, sizeof(*s));
 
    size_t disk = slab_worker_id / (get_nb_workers()/get_nb_disks());
-   sprintf(path, PATH, disk, slab_worker_id, 0LU, item_size);
+   if(is_transaction)
+      sprintf(path, PATH_TRANSACTIONS, disk, slab_worker_id, item_size);
+   else
+      sprintf(path, PATH, disk, slab_worker_id, item_size);
    s->fd = open(path,  O_RDWR | O_CREAT | O_DIRECT, 0777);
    if(s->fd == -1)
       perr("Cannot allocate slab %s", path);
@@ -129,7 +147,7 @@ struct slab* create_slab(struct slab_context *ctx, int slab_worker_id, size_t it
    s->nb_max_items = s->size_on_disk / PAGE_SIZE * nb_items_per_page;
    s->nb_items = 0;
    s->item_size = item_size;
-   s->nb_free_items = 0;
+   s->nb_partially_freed_items = 0;
    s->last_item = 0;
    s->ctx = ctx;
 
@@ -143,6 +161,14 @@ struct slab* create_slab(struct slab_context *ctx, int slab_worker_id, size_t it
    return s;
 }
 
+struct slab* create_slab(struct slab_context *ctx, int slab_worker_id, size_t item_size, struct slab_callback *callback) {
+   return _create_slab(ctx, slab_worker_id, item_size, callback, 0);
+}
+
+struct slab* create_transactions_slab(struct slab_context *ctx, int slab_worker_id, struct slab_callback *callback) {
+   return _create_slab(ctx, slab_worker_id, TRANSACTION_OBJECT_SIZE, callback, 1);
+}
+
 /*
  * Double the size of a slab on disk
  */
@@ -154,7 +180,8 @@ struct slab* resize_slab(struct slab *s) {
       s->nb_max_items *= 2;
    } else {
       size_t nb_items_per_page = PAGE_SIZE / s->item_size;
-      s->size_on_disk += 10000000000LU;
+      //s->size_on_disk += 10000000000LU;
+      s->size_on_disk += 1000000000LU;
       if(fallocate(s->fd, 0, 0, s->size_on_disk))
          perr("Cannot resize slab (item size %lu) new size %lu\n", s->item_size, s->size_on_disk);
       s->nb_max_items = s->size_on_disk / PAGE_SIZE * nb_items_per_page;
@@ -167,7 +194,7 @@ struct slab* resize_slab(struct slab *s) {
 
 
 /*
- * Synchronous read item
+ * Synchronous read and write item (unsafe)
  */
 void *read_item(struct slab *s, size_t idx) {
    size_t page_num = item_page_num(s, idx);
@@ -175,17 +202,44 @@ void *read_item(struct slab *s, size_t idx) {
    return &disk_data[item_in_page_offset(s, idx)];
 }
 
+void write_item(struct slab *s, size_t idx, void *data) {
+   size_t page_num = item_page_num(s, idx);
+   size_t offset = item_in_page_offset(s, idx);
+   size_t size = get_item_size(data);
+   safe_pwrite(s->fd, page_num*PAGE_SIZE, offset, size, data);
+   return;
+}
+
+/*
+ * Helper function:
+ * Because the indexes only store prefixes, we might try to update the wrong location. Check that here!
+ */
+static void check_if_keys_match(char *old_item, char *new_item) {
+   struct item_metadata *new_meta = (void*)new_item;
+   struct item_metadata *old_meta = (void*)old_item;
+
+   size_t new_key_size = new_meta->key_size;
+   size_t old_key_size = old_meta->key_size;
+   if(new_key_size != old_key_size) {
+      die("Updating an item, but key size changed! Likely this is because 2 keys have the same prefix in the index and we got confused because they have the same prefix. TODO: make the index more robust by detecting that 2 keys have the same prefix and transforming the prefix -> slab_idx to prefix -> [ { full key 1, slab_idx1 }, { full key 2, slab_idx2 } ]\n");
+   }
+
+   char *new_key = &new_item[sizeof(*new_meta)];
+   char *old_key = &old_item[sizeof(*old_meta)];
+   if(memcmp(new_key, old_key, new_key_size))
+      die("Updating an item, but key mismatch! Likely this is because 2 keys have the same prefix in the index. TODO: make the index more robust by detecting that 2 keys have the same prefix and transforming the prefix -> slab_idx to prefix -> [ { full key 1, slab_idx1 }, { full key 2, slab_idx2 } ]\n");
+}
+
+
 /*
  * Asynchronous read
  * - read_item_async creates a callback for the ioengine and queues the io request
  * - read_item_async_cb is called when io is completed (might be synchronous if page is cached)
- * If nothing happen it is because do_io is not called.
  */
-void read_item_async_cb(struct slab_callback *callback) {
+static void read_item_async_cb(struct slab_callback *callback) {
    char *disk_page = callback->lru_entry->page;
    off_t in_page_offset = item_in_page_offset(callback->slab, callback->slab_idx);
-   if(callback->cb)
-      callback->cb(callback, &disk_page[in_page_offset]);
+   call_callback(callback, &disk_page[in_page_offset]);
 }
 
 void read_item_async(struct slab_callback *callback) {
@@ -194,19 +248,31 @@ void read_item_async(struct slab_callback *callback) {
 }
 
 /*
- * Asynchronous update item:
+ * Generic callbacks called after doing a write.
+ * If the update is "in place" then old_slab = NULL and the function calls the user callback (no cleaning needed to be performed)
+ * If the update is "not in place", then the old location is marked as deleted and the user callback is called.
+ */
+static void finish_update_cb(struct slab_callback *callback) {
+   if(callback->needs_cleanup) { // The update was not in place, we need to do some cleaning
+      uint64_t index_rdt = memory_item_update_remove_lock(callback, callback->item); // Update the location of the item on disk
+
+      /* Mark the old spot as deleted but don't actually delete it, put in in the free list instead */
+      add_item_in_gc(get_gc_for_item(callback->item), callback, index_rdt);
+
+      /* Complete the call */
+      call_callback(callback, NULL);
+   } else { // update complete, return the updated item
+      call_callback(callback, NULL);
+   }
+}
+
+/*
+ * Generic function called to write the new version of the item on disk.
  * - First read the page where the item is staying
  * - Once the page is in page cache, write it
  * - Then send the order to flush it.
  */
-void update_item_async_cb2(struct slab_callback *callback) {
-   char *disk_page = callback->lru_entry->page;
-   off_t in_page_offset = item_in_page_offset(callback->slab, callback->slab_idx);
-   if(callback->cb)
-      callback->cb(callback, &disk_page[in_page_offset]);
-}
-
-void update_item_async_cb1(struct slab_callback *callback) {
+static void generic_add_or_update_with_location_cb1(struct slab_callback *callback) {
    char *disk_page = callback->lru_entry->page;
 
    struct slab *s = callback->slab;
@@ -214,22 +280,24 @@ void update_item_async_cb1(struct slab_callback *callback) {
    void *item = callback->item;
    struct item_metadata *meta = item;
    off_t offset_in_page = item_in_page_offset(s, idx);
-   struct item_metadata *old_meta = (void*)(&disk_page[offset_in_page]);
+   void *old_item = &disk_page[offset_in_page];
 
-   if(callback->action == UPDATE) {
-      size_t new_key_size = meta->key_size;
-      size_t old_key_size = old_meta->key_size;
-      if(new_key_size != old_key_size) {
-         die("Updating an item, but key size changed! Likely this is because 2 keys have the same prefix in the index and we got confused because they have the same prefix. TODO: make the index more robust by detecting that 2 keys have the same prefix and transforming the prefix -> slab_idx to prefix -> [ { full key 1, slab_idx1 }, { full key 2, slab_idx2 } ]\n");
-      }
-
-      char *new_key = &disk_page[offset_in_page + sizeof(*meta)];
-      char *old_key = &(((char*)old_meta)[sizeof(*meta)]);
-      if(memcmp(new_key, old_key, new_key_size))
-         die("Updating an item, but key mismatch! Likely this is because 2 keys have the same prefix in the index. TODO: make the index more robust by detecting that 2 keys have the same prefix and transforming the prefix -> slab_idx to prefix -> [ { full key 1, slab_idx1 }, { full key 2, slab_idx2 } ]\n");
+   if(callback->propagate_value_until && TRANSACTION_TYPE == TRANS_LONG && callback->action != START_TRANSACTION_COMMIT) { // do not propagate commit id on disk, these are never scanned
+      transaction_propagate(old_item, callback->propagate_value_until);
+      memory_index_clean_specific_version(old_item);
    }
 
-   meta->rdt = get_rdt(s->ctx);
+   if(callback->transaction)
+      meta->rdt = get_transaction_id_on_disk(callback->transaction);
+   else
+      meta->rdt = get_rdt(s->ctx);
+
+   if(callback->action == UPDATE_IN_PLACE) {
+      check_if_keys_match(item, &disk_page[offset_in_page]);
+   } else if(callback->action == ADD || callback->action == START_TRANSACTION_COMMIT) { // Not an in place update, and the item had no location before, it is a new item, so we add it in the tree!
+      memory_index_add(callback, item); // must happen after setting ->rdt!
+   }
+
    if(meta->key_size == -1)
       memcpy(&disk_page[offset_in_page], meta, sizeof(*meta));
    else if(get_item_size(item) > s->item_size)
@@ -237,61 +305,65 @@ void update_item_async_cb1(struct slab_callback *callback) {
    else
       memcpy(&disk_page[offset_in_page], item, get_item_size(item));
 
-   callback->io_cb = update_item_async_cb2;
+   callback->io_cb = finish_update_cb;
    write_page_async(callback);
 }
 
-void update_item_async(struct slab_callback *callback) {
-   callback->io_cb = update_item_async_cb1;
+static void generic_add_or_update_with_location(struct slab_callback *callback) {
+   callback->io_cb = generic_add_or_update_with_location_cb1;
    read_page_async(callback);
 }
 
-/*
- * Add an item is just like updating, but we need to find a suitable page first!
- * get_free_item_idx returns lru_entry == NULL if no page with empty spot exist.
- * If a page with an empty spot exists, we have to scan it to find a suitable spot.
- */
-void add_item_async_cb1(struct slab_callback *callback) {
-   struct slab *s = callback->slab;
+void update_in_place_item_async(struct slab_callback *callback) {
+   generic_add_or_update_with_location(callback); // in place update, we know where to write
+}
 
-   struct lru *lru_entry = callback->lru_entry;
-   if(lru_entry == NULL) { // no free page, append
+/*
+ * Update (not in place) or add an item -- we need to find a suitable page first!
+ * get_free_item_idx returns lru_entry == NULL if no page with empty spot exist.
+ * If a page with an empty spot exists, we add its son in the in memory free list.
+ */
+static void generic_add_or_update_cb(struct slab_callback *callback) {
+   struct slab *s = callback->slab;
+   if(callback->slab_idx == -1) { // no free page, append
       if(s->last_item >= s->nb_max_items)
          resize_slab(s);
       callback->slab_idx = s->last_item;
       assert(s->last_item < s->nb_max_items);
       s->last_item++;
-   } else { // reuse a free spot. Don't forget to add the linked tombstone in the freelist.
-      char *disk_page = callback->lru_entry->page;
-      off_t in_page_offset = item_in_page_offset(callback->slab, callback->slab_idx);
-      add_son_in_freelist(callback->slab, callback->slab_idx, (void*)(&disk_page[in_page_offset]));
    }
    s->nb_items++;
-
-   update_item_async(callback);
+   generic_add_or_update_with_location(callback);
 }
 
-void add_item_async(struct slab_callback *callback) {
-   callback->io_cb = add_item_async_cb1;
+static void generic_add_or_update(struct slab_callback *callback) {
+   callback->io_cb = generic_add_or_update_cb;
    get_free_item_idx(callback);
 }
 
+void add_item_async(struct slab_callback *callback) {
+   generic_add_or_update(callback);
+}
+
+void update_item_async(struct slab_callback *callback) {
+   generic_add_or_update(callback); // an update is first an add when not in place
+}
 
 /*
  * Remove an item
  */
-void remove_item_by_idx_async_cb1(struct slab_callback *callback) {
+static void remove_item_async_cb1(struct slab_callback *callback) {
    char *disk_page = callback->lru_entry->page;
 
    struct slab *s = callback->slab;
    size_t idx = callback->slab_idx;
 
    off_t offset_in_page = item_in_page_offset(s, idx);
-
    struct item_metadata *meta = (void*)&disk_page[offset_in_page];
+
    if(meta->key_size == -1) { // already removed
       if(callback->cb)
-         callback->cb(callback, &disk_page[offset_in_page]);
+         call_callback(callback, NULL);
       return;
    }
 
@@ -299,14 +371,25 @@ void remove_item_by_idx_async_cb1(struct slab_callback *callback) {
    meta->key_size = -1;
 
    s->nb_items--;
-   add_item_in_free_list(s, idx, meta);
 
-   callback->io_cb = update_item_async_cb2;
+   add_item_in_partially_freed_list(s, idx, 0);
+   callback->io_cb = finish_update_cb;
    write_page_async(callback);
 }
 
 
 void remove_item_async(struct slab_callback *callback) {
-   callback->io_cb = remove_item_by_idx_async_cb1;
+   callback->io_cb = remove_item_async_cb1;
    read_page_async(callback);
+}
+
+struct slab_callback *clone_callback(struct slab_callback *cb) {
+   struct slab_callback *ncb = malloc(sizeof(*ncb));
+   memcpy(ncb, cb, sizeof(*ncb));
+   return ncb;
+}
+
+int callback_is_reading(struct slab_callback *callback) {
+   int action = callback->action;
+   return action == READ || action == READ_NEXT || action == READ_NEXT_BATCH || action == READ_NEXT_BATCH_CLONE || action == READ_NO_LOOKUP || action == UPDATE_IN_PLACE;
 }

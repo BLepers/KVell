@@ -34,10 +34,31 @@ unsigned long locxorshf96(void) {          //period 2^96-1
    return _z;
 }
 
+
+
 /* Init a per thread seed in a thread safe way */
 static unsigned int __thread seed;
+static __uint128_t __thread g_lehmer64_state;
 void init_seed(void) {
    seed = rand();
+   g_lehmer64_state = seed;
+}
+
+/* Proper uniform random because rand_r is really a poor random -- http://www.azillionmonkeys.com/qed/random.html */
+#define RS_SCALE (1.0 / (1.0 + RAND_MAX))
+double drand (void) {
+    double d;
+    do {
+       d = (((rand_r(&seed) * RS_SCALE) + rand_r(&seed)) * RS_SCALE + rand_r(&seed)) * RS_SCALE;
+    } while (d >= 1);
+    return d;
+}
+#define lrand(x) ((unsigned long) ((x) * drand ()))
+
+// Super fast and actually really good random
+uint64_t lehmer64() {
+  g_lehmer64_state *= 0xda942042e4dd58b5;
+  return g_lehmer64_state >> 64;
 }
 
 /* zipf - from https://bitbucket.org/theoanab/rocksdb-ycsb/src/master/util/zipf.h */
@@ -98,7 +119,8 @@ long next_long(long itemcount){
 		}
 	}
 
-	double u = (double)(rand_r(&seed)%RAND_MAX) / ((double)RAND_MAX);
+   //double u = (double)(rand_r(&seed)%RAND_MAX) / ((double)RAND_MAX);
+	double u = (double)(lehmer64()%RAND_MAX) / ((double)RAND_MAX);
 	double uz=u*zetan;
 	if (uz < 1.0){
 		return base;
@@ -117,8 +139,27 @@ long zipf_next() {
 
 /* Uniform */
 long uniform_next() {
-   return rand_r(&seed) % items;
+   return lehmer64() % items;
+   //return rand_r(&seed) % items;
 }
+
+long rand_between(long a, long b) {
+   if(a == b)
+      return a;
+   //return a + lrand(b-a);
+   //return a + rand_r(&seed) % (b - a);
+   return a + lehmer64() % (b - a);
+}
+
+float rand_float_between(float a, float b) {
+   if(a == b)
+      return a;
+
+   float diff = b - a;
+   float r = ((float)rand_r(&seed)) / ((float)RAND_MAX);
+   return a + r * diff;
+}
+
 
 /* bogus rand */
 long bogus_rand() {

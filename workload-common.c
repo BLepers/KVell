@@ -3,18 +3,24 @@
 /*
  * Create a workload item for the database
  */
-char *create_unique_item(size_t item_size, uint64_t uid) {
+char *create_unique_item_with_value(size_t item_size, uint64_t uid, uint64_t val) {
    char *item = malloc(item_size);
    struct item_metadata *meta = (struct item_metadata *)item;
    meta->key_size = 8;
-   meta->value_size = item_size - 8 - sizeof(*meta);
+   meta->value_size = item_size - 64 - sizeof(*meta);
 
    char *item_key = &item[sizeof(*meta)];
    char *item_value = &item[sizeof(*meta) + meta->key_size];
    *(uint64_t*)item_key = uid;
-   *(uint64_t*)item_value = uid;
+   *(uint64_t*)item_value = val;
    return item;
 }
+
+char *create_unique_item(size_t item_size, uint64_t uid) {
+   return create_unique_item_with_value(item_size, uid, uid);
+}
+
+
 
 /* We also store an item in the database that says if the database has been populated for YCSB, PRODUCTION, or another workload. */
 char *create_workload_item(struct workload *w) {
@@ -40,7 +46,6 @@ char *create_workload_item(struct workload *w) {
  * Fill the DB with missing items
  */
 static void add_in_tree(struct slab_callback *cb, void *item) {
-   memory_index_add(cb, item);
    free(cb->item);
    free(cb);
 }
@@ -64,7 +69,7 @@ void *repopulate_db_worker(void *pdata) {
    size_t start = data->start;
    size_t end = data->end;
    for(size_t i = start; i < end; i++) {
-      struct slab_callback *cb = malloc(sizeof(*cb));
+      struct slab_callback *cb = new_slab_callback();
       cb->cb = add_in_tree;
       cb->payload = NULL;
       cb->item = api->create_unique_item(pos[i], w->nb_items_in_db);
@@ -83,7 +88,7 @@ void repopulate_db(struct workload *w) {
 
    if(nb_inserts != w->nb_items_in_db) { // Database at least partially populated
       // Check that the items correspond to the workload
-      char *db_item = kv_read_sync(workload_item);
+      char *db_item = kv_read_sync_safe(workload_item);
       if(!db_item)
          die("Running a benchmark on a pre-populated DB, but couldn't determine if items in the DB correspond to the benchmark --- please wipe DB before benching!\n");
       struct item_metadata *meta = (struct item_metadata *)db_item;
@@ -101,7 +106,7 @@ void repopulate_db(struct workload *w) {
 
    // Say that this database is for that workload
    if(nb_items_already_in_db == 0) {
-      struct slab_callback *cb = malloc(sizeof(*cb));
+      struct slab_callback *cb = new_slab_callback();
       cb->cb = add_in_tree;
       cb->payload = NULL;
       cb->item = workload_item;
@@ -163,7 +168,7 @@ void print_item(size_t idx, void* _item) {
    else if(meta->key_size == -1)
       printf("[%lu] Removed\n", idx);
    else
-      printf("[%lu] K=%lu V=%s\n", idx, *(uint64_t*)item_key, &item[sizeof(*meta) + meta->key_size]);
+      printf("[%lu] K=%lu V=%lu\n", idx, *(uint64_t*)item_key, *(uint64_t*)&item[sizeof(*meta) + meta->key_size]);
 }
 
 /*
@@ -206,7 +211,7 @@ void compute_stats(struct slab_callback *cb, void *item) {
 }
 
 struct slab_callback *bench_cb(void) {
-   struct slab_callback *cb = malloc(sizeof(*cb));
+   struct slab_callback *cb = new_slab_callback();
    cb->cb = compute_stats;
    cb->payload = allocate_payload();
    return cb;

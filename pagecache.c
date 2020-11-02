@@ -72,9 +72,16 @@ void bump_page_in_lru(struct pagecache *p, struct lru *me, uint64_t hash) {
  */
 int get_page(struct pagecache *p, uint64_t hash, void **page, struct lru **lru) {
    void *dst;
-   struct lru *lru_entry;
-   maybe_unused pagecache_entry_t tmp_entry;
+   struct lru *lru_entry = *lru;
+   maybe_unused pagecache_entry_t *tmp_entry;
    maybe_unused pagecache_entry_t *old_entry = NULL;
+
+   // The user gave us a possible lru entry, check if it still contains the data
+   if(lru_entry && lru_entry->hash == hash) {
+      bump_page_in_lru(p, lru_entry, hash);
+      *page = lru_entry->page;
+      return 1;
+   }
 
    // Is the page already cached?
    pagecache_entry_t *e = tree_lookup(p->hash_to_page, hash);

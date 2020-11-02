@@ -87,6 +87,8 @@ void add_time_in_payload(struct slab_callback *c, size_t origin) {
 #else
    if(origin != 0)
       return;
+   if(c->payload)
+      return;
    uint64_t t;
    rdtscll(t);
    c->payload = (void*)t;

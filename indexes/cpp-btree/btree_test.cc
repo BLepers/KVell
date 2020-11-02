@@ -13,13 +13,11 @@
 // limitations under the License.
 
 #include "btree_map.h"
-#include "../../utils.h"
-#include "../rbtree.h"
 
 using namespace std;
 using namespace btree;
 
-#define NB_INSERTS 10000000LU
+#define NB_INSERTS 10000LU
 
 static unsigned long x=123456789, y=362436069, z=521288629;
 unsigned long xorshf96(void) {          //period 2^96-1
@@ -37,23 +35,13 @@ unsigned long xorshf96(void) {          //period 2^96-1
 }
 
 int main(int argc, char**argv) {
-   declare_timer;
-   btree_map<uint64_t, struct rbtree_entry> *b = new btree_map<uint64_t, struct rbtree_entry>();
+   btree_map<uint64_t, int> *b = new btree_map<uint64_t, int>();
 
-   start_timer {
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         struct rbtree_entry e;
-         b->insert(make_pair(hash, e));
-      }
-   } stop_timer("BTREE - Time for %lu inserts/replace (%lu inserts/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
-
-   start_timer {
-      for(size_t i = 0; i < NB_INSERTS; i++) {
-         uint64_t hash = xorshf96()%NB_INSERTS;
-         b->find(hash);
-      }
-   } stop_timer("BTREE - Time for %lu finds (%lu finds/s)", NB_INSERTS, NB_INSERTS*1000000LU/elapsed);
+   for(size_t i = 0; i < NB_INSERTS; i++) {
+      uint64_t hash = xorshf96()%NB_INSERTS;
+      b->insert(make_pair(hash, 1));
+   }
+   printf("Size %lu\n", b->size());
 
    return 0;
 }
