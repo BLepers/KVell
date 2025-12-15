@@ -188,7 +188,7 @@ long production_random1(void) {
 
 long production_random2(void) {
    long rand_key = rand_r(&seed);
-   long prob = rand_r(&seed) % 10000;
+   long prob = rand_r(&seed) % 1000000;
    if (prob < 103487) {
       rand_key = rand_key % 47016400;
    } else if (prob < 570480) {
